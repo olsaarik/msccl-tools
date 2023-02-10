@@ -24,8 +24,10 @@ class MSCCLProgramV2:
             self.f32_memref_type = ir.MemRefType.get([-1], ir.F32Type.get())
             with ir.InsertionPoint(self.module.body):
                 self.main_func = func.FuncOp(self.name, ir.FunctionType.get([self.f32_memref_type, self.f32_memref_type], []))
-        self.main_func.add_entry_block()
-        self.insertion_point = ir.InsertionPoint(self.main_func.entry_block)
+            self.main_func.add_entry_block()
+            with ir.InsertionPoint(self.main_func.entry_block):
+                func.ReturnOp([])
+        self.insertion_point = ir.InsertionPoint.at_block_begin(self.main_func.entry_block)
 
     def _get_caller_location(self, level=1):
         caller = getframeinfo(stack()[1 + level][0])
@@ -49,15 +51,11 @@ class MSCCLProgramV2:
         self.context.__exit__(exc_type, exc_value, exc_traceback)
         _current_program = None
 
-    # Context manager for interacting with MLIR that sets the context, insertion point and location
-    def _code_generation_context(self):
-        return self._get_caller_location(level=2)
-
 def _promote_to_expr(value):
     if isinstance(value, Expr):
         return value
     if isinstance(value, int):
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return Expr(arith.ConstantOp(ir.IndexType.get(), value))
     raise ValueError(f'Cannot promote {value} to Expr')
 
@@ -78,39 +76,39 @@ class Expr:
 
     def size(self):
         # Return the size with memref.dim
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             zero = _promote_to_expr(0)
             return Expr(memref.DimOp(ir.IndexType.get(), self.mlir_value, zero.mlir_value))
 
     # Overload operators that generate instructions in the arith dialect
     def __add__(self, other):
         other = _promote_to_expr(other)
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return Expr(arith.AddIOp(self.mlir_value, other.mlir_value))
     
     def __sub__(self, other):
         other = _promote_to_expr(other)
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return Expr(arith.SubIOp(self.mlir_value, other.mlir_value))
 
     def __mul__(self, other):
         other = _promote_to_expr(other)
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return Expr(arith.MulIOp(self.mlir_value, other.mlir_value))
 
     def __truediv__(self, other):
         other = _promote_to_expr(other)
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return Expr(arith.DivIOp(self.mlir_value, other.mlir_value))
 
     def __floordiv__(self, other):
         other = _promote_to_expr(other)
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return Expr(arith.FloorDivIOp(self.mlir_value, other.mlir_value))
 
     def __mod__(self, other):
         other = _promote_to_expr(other)
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return Expr(arith.RemUIOp(self.mlir_value, other.mlir_value))
 
     # Overload element access for chunk indexing
@@ -129,7 +127,7 @@ class Expr:
         else:
             chunk = _promote_to_expr(key)
 
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             one = arith.ConstantOp(ir.IndexType.get(), 1)
             volume = collcomm.ChunkVolOp(size.mlir_value, chunks.mlir_value, chunk.mlir_value,
                 one)
@@ -152,15 +150,15 @@ class Expr:
 
     # Implement collcomm operations send, recv, recv_reduce
     def send(self, chunk):
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return collcomm.SendOp(self.mlir_value, chunk.mlir_value)
 
     def recv(self, chunk):
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return collcomm.RecvOp(self.mlir_value, chunk.mlir_value)
 
     def recv_reduce(self, chunk):
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             return collcomm.RecvReduceOp(self.mlir_value, chunk.mlir_value)
 
 # Context manager for for_range loops
@@ -172,21 +170,23 @@ class for_range:
 
     # Generate a loop in the scf dialect and return the loop variable
     def __enter__(self):
-        with _curr()._code_generation_context():
+        with _curr()._get_caller_location():
             loop = scf.ForOp(self.start.mlir_value, self.end.mlir_value, self.step.mlir_value)
             self.insertion_point = ir.InsertionPoint(loop.body)
         self.insertion_point.__enter__()
         return Expr(loop.induction_variable)
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
+        with _curr()._get_caller_location():
+            scf.YieldOp([])
         self.insertion_point.__exit__(exc_type, exc_value, exc_traceback)
 
 def ProcId():
-    with _curr()._code_generation_context():
+    with _curr()._get_caller_location():
         return Expr(collcomm.ProcIdOp())
 
 def ProcDim():
-    with _curr()._code_generation_context():
+    with _curr()._get_caller_location():
         return Expr(collcomm.ProcDimOp())
 
 def Input():
@@ -196,11 +196,11 @@ def Output():
     return Expr(_curr().main_func.arguments[1])
 
 def Channel(peer, port=0):
-    with _curr()._code_generation_context():
+    with _curr()._get_caller_location():
         return Expr(collcomm.CreateChannelOp(_promote_to_expr(peer).mlir_value, _promote_to_expr(port).mlir_value))
 
 def RelayChannel(recv_peer, send_peer, port=0):
-    with _curr()._code_generation_context():
+    with _curr()._get_caller_location():
         return Expr(collcomm.CreateRelayChannelOp(_promote_to_expr(recv_peer).mlir_value, _promote_to_expr(send_peer).mlir_value, _promote_to_expr(port).mlir_value))
 
 # Decorator for triggering compilation
